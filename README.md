@@ -1,155 +1,65 @@
-# LLM.swift (LoRA Hot-Loading Fork)
+# LLM.swift (Tethr Fork)
 
 [![](https://img.shields.io/endpoint?url=https%3A%2F%2Fswiftpackageindex.com%2Fapi%2Fpackages%2Feastriverlee%2FLLM.swift%2Fbadge%3Ftype%3Dswift-versions)](https://swiftpackageindex.com/eastriverlee/LLM.swift)
 [![](https://img.shields.io/endpoint?url=https%3A%2F%2Fswiftpackageindex.com%2Fapi%2Fpackages%2Feastriverlee%2FLLM.swift%2Fbadge%3Ftype%3Dplatforms)](https://swiftpackageindex.com/eastriverlee/LLM.swift)
 
 `LLM.swift` is a simple and readable library that allows you to interact with large language models locally with ease for macOS, iOS, watchOS, tvOS, and visionOS.
 
-## 🔥 New in This Fork: LoRA Adapter Hot-Loading
+## New in This Fork
 
-This fork adds **real-time LoRA adapter hot-loading** capabilities, perfect for iOS offline persona chat applications:
+### Embed-Only Model Support
 
-- ✅ **Hot-swap LoRA adapters** without restarting the model
-- ✅ **Multiple adapters** can be active simultaneously  
-- ✅ **Metal GPU acceleration** - all layers offloaded to GPU on real devices
-- ✅ **Multi-threaded inference** - uses all CPU cores for maximum performance
-- ✅ **Latest llama.cpp** with full LoRA support
-- ✅ **Simple async/await API** for adapter management
+This fork adds **lightweight `EmbeddingModel`** class optimized for embed-only models like `nomic-embed-text` and `all-MiniLM`, perfect for RAG pipelines:
 
-### Quick LoRA Example
-
-```swift
-// Load a LoRA adapter
-try await llm.loadLoRAAdapter(from: "/path/to/persona-adapter.gguf", scale: 1.0, name: "friendly")
-
-// Swap to a different adapter
-try await llm.swapLoRAAdapter(from: "friendly", to: "/path/to/professional-adapter.gguf", name: "professional")
-
-// Remove an adapter
-try await llm.removeLoRAAdapter(named: "friendly")
-
-// Check active adapters
-print(llm.activeLoRAAdapterNames) // ["professional"]
-```
-
-📖 **[Quick Start Guide](QUICK_START.md)** | 💡 **[Example App](Examples/PersonaChatExample.swift)**
-
----
-
-## LoRA API Reference
-
-### Load & Manage Adapters
+- **Fast embeddings**: 1-35ms per embedding on iPhone
+- **Parallel model support**: Run chat model + embedding model simultaneously
+- **Lightweight**: No generation overhead, samplers, or chat history
+- **Thread-safe**: Uses Swift actors for isolation
+- **L2 normalized**: Output vectors ready for cosine similarity
 
 ```swift
-// Load adapter
-try await llm.loadLoRAAdapter(from: "/path/to/adapter.gguf", scale: 1.0, name: "persona1")
+// Load embed-only model (nomic-embed-text, all-MiniLM, etc.)
+let embedder = try EmbeddingModel(from: "nomic-embed-text-v1.5.Q4_0.gguf")
 
-// Swap adapters (efficient)
-try await llm.swapLoRAAdapter(from: "persona1", to: "/path/to/adapter2.gguf", name: "persona2")
+// Generate embeddings
+let embedding = try await embedder.embed("Hello, world!")
+print(embedding.dimension) // 768 for nomic, 384 for MiniLM
 
-// Remove adapter
-try await llm.removeLoRAAdapter(named: "persona1")
+// Semantic similarity
+let score = try await embedder.similarity(between: "What is AI?", and: "Artificial intelligence explained")
+print(score) // 0.85
 
-// Clear all adapters
-await llm.clearAllLoRAAdapters()
-
-// Update adapter scale
-try await llm.updateLoRAAdapterScale(named: "persona2", scale: 0.8)
-
-// Check active adapters
-print(llm.activeLoRAAdapterNames) // ["persona2"]
+// Rank candidates
+let results = try await embedder.rank(query: "programming", candidates: texts, topK: 5)
 ```
 
-### SwiftUI Integration
+### Parallel Model Loading
+
+Run chat and embedding models simultaneously for sub-second RAG latency:
 
 ```swift
-struct ChatView: View {
-    @StateObject var bot: LLM
-    
-    var body: some View {
-        VStack {
-            // Active adapters display
-            Text("Active: \(bot.activeLoRAAdapterNames.joined(separator: ", "))")
-            
-            // Persona picker
-            Picker("Persona", selection: $selectedPersona) {
-                Text("Default").tag("default")
-                Text("Friendly").tag("friendly")
-            }
-            .onChange(of: selectedPersona) { newValue in
-                Task {
-                    if newValue == "default" {
-                        await bot.clearAllLoRAAdapters()
-                    } else {
-                        try? await bot.loadLoRAAdapter(
-                            from: "/path/to/\(newValue).gguf",
-                            name: newValue
-                        )
-                    }
-                }
-            }
-        }
-    }
-}
+// Load both models in parallel
+let embedder = try EmbeddingModel(from: "nomic-embed-text.gguf")
+let chatModel = LLM(from: "gemma-3-4b-it.gguf", template: .gemma3)!
+
+// Use embedder for RAG context retrieval
+let queryEmbedding = try await embedder.embed(userQuery)
+let relevantChunks = vectorStore.search(queryEmbedding, topK: 5)
+
+// Use chat model for generation
+let contextPrompt = buildPrompt(userQuery, relevantChunks)
+await chatModel.respond(to: contextPrompt)
 ```
 
-### Performance Tips
+### Thinking Output Separation
 
-**Adapter Scales:**
-- `0.5-0.7`: Subtle influence
-- `0.8-1.0`: Balanced (recommended)
-- `1.1-1.5`: Strong influence
-
-**Model Sizes:**
-- iPhone: 3B-4B parameters
-- iPad: 7B parameters
-- Mac: 7B-13B parameters
-
-### Error Handling
+Support for models with Chain of Thought (CoT) reasoning:
 
 ```swift
-do {
-    try await llm.loadLoRAAdapter(from: path)
-} catch LLMError.loraLoadFailed {
-    print("Check file path and format")
-} catch LLMError.loraApplyFailed {
-    print("Adapter may be incompatible")
-} catch {
-    print("Error: \(error)")
-}
+await bot.respond(to: input, thinking: .enabled)
+print(bot.thinking) // Internal reasoning
+print(bot.output)   // Final response
 ```
-
-### Technical Details
-
-**Metal GPU Acceleration:**
-- All model layers offloaded to GPU (`n_gpu_layers = 999`)
-- Automatic on real devices, disabled on simulator
-- Zero configuration required
-
-**Multi-Threading:**
-- Uses all CPU cores for inference
-- Batch processing parallelized
-- Adapts to device capabilities
-
-**Memory Management:**
-- Adapters cached to avoid reloading
-- Auto-freed when model deallocated
-- Manual cleanup: `clearAllLoRAAdapters()`
-
-**Performance:**
-- First load: 100-500ms
-- Cached load: <10ms
-- Swap operation: Atomic, instant
-
-### Requirements
-
-- iOS 16.0+ / macOS 13.0+
-- Base model: GGUF format
-- LoRA adapters: GGUF format, compatible with base model
-- Metal-compatible device for GPU acceleration
-
-> [!IMPORTANT]
-> **LoRA Inference Limitation**: The prebuilt llama.cpp xcframework has a computation graph size limitation (2048 nodes) that prevents LoRA inference from working. All LoRA management APIs work correctly, but inference with adapters active will crash. To use LoRA adapters, rebuild llama.cpp with `GGML_DEFAULT_GRAPH_SIZE = 8192`. See QUICK_START.md for details and solutions.
 
 ---
 
@@ -489,13 +399,54 @@ The `thinking` property on your bot instance will contain the accumulated though
 
 ## Embeddings
 
-LLM.swift supports text embeddings for semantic similarity and search applications:
+LLM.swift supports text embeddings for semantic similarity and search applications.
+
+### Using EmbeddingModel (Recommended for RAG)
+
+For RAG pipelines, use the lightweight `EmbeddingModel` class with embed-only models:
 
 ```swift
-// Generate embeddings for text
+// Load embed-only model (much faster than using chat models for embeddings)
+let embedder = try EmbeddingModel(from: "nomic-embed-text-v1.5.Q4_0.gguf")
+
+// Generate embeddings
+let embedding = try await embedder.embed("Hello world")
+print(embedding.dimension) // 768
+
+// Semantic similarity
+let score = try await embedder.similarity(
+    between: "What is machine learning?",
+    and: "ML is a subset of AI"
+)
+print(score) // 0.80
+
+// Rank candidates by relevance
+let results = try await embedder.rank(
+    query: "programming tutorials",
+    candidates: ["Python basics", "Cooking recipes", "JavaScript guide"],
+    topK: 2
+)
+// Returns: [("Python basics", 0.72, 0), ("JavaScript guide", 0.68, 2)]
+
+// Find most similar
+let best = try await embedder.findMostSimilar(to: query, in: candidates)
+print(best?.text) // Most relevant text
+```
+
+**Supported embed-only models:**
+- `nomic-embed-text-v1.5` (768 dims, ~78MB)
+- `all-MiniLM-L6-v2` (384 dims, ~21MB)
+- `bge-small/base/large`
+- `gte-small/base`
+- Any GGUF embedding model
+
+### Using LLM Class (for chat models)
+
+You can also generate embeddings from chat models (slower but no extra model needed):
+
+```swift
 let embeddings1 = try await bot.getEmbeddings("Hello world")
 let embeddings2 = try await bot.getEmbeddings("Hi there")
-let embeddings3 = try await bot.getEmbeddings("Goodbye")
 
 // Compare similarity (returns 0.0 to 1.0)
 let similarity = embeddings1.compare(with: embeddings2)
@@ -503,7 +454,6 @@ print(similarity) // 0.8 (high similarity)
 
 // Find most similar embedding
 let mostSimilar = embeddings1.findMostSimilar(in: embeddings2, embeddings3)
-print(mostSimilar == embeddings2) // true
 ```
 
 The `Embeddings` struct provides:
