@@ -33,12 +33,12 @@ print(score) // 0.85
 let results = try await embedder.rank(query: "programming", candidates: texts, topK: 5)
 ```
 
-### Parallel Model Loading
+### Multi-Model Support (LlamaBackend)
 
-Run chat and embedding models simultaneously for sub-second RAG latency:
+Run chat and embedding models simultaneously with automatic GPU serialization:
 
 ```swift
-// Load both models in parallel
+// Load both models - they coexist in memory
 let embedder = try EmbeddingModel(from: "nomic-embed-text.gguf")
 let chatModel = LLM(from: "gemma-3-4b-it.gguf", template: .gemma3)!
 
@@ -50,6 +50,12 @@ let relevantChunks = vectorStore.search(queryEmbedding, topK: 5)
 let contextPrompt = buildPrompt(userQuery, relevantChunks)
 await chatModel.respond(to: contextPrompt)
 ```
+
+**How it works:**
+- Both models stay loaded in GPU/CPU memory simultaneously
+- GPU operations (`llama_decode`) are automatically serialized via `LlamaBackend`
+- No manual synchronization needed - the library handles it internally
+- Prevents Metal resource conflicts that cause crashes
 
 ### Thinking Output Separation
 

@@ -42,19 +42,9 @@ public actor EmbeddingModel {
     /// Path to the loaded model file.
     public nonisolated let modelPath: String
     
-    private static var isBackendInitialized = false
-    
-    private static func ensureBackendInitialized() {
-        guard !isBackendInitialized else { return }
-        isBackendInitialized = true
-        llama_backend_init()
-    }
-    
     /// Silences llama.cpp logging output.
     public static func silenceLogging() {
-        let noopCallback: @convention(c) (ggml_log_level, UnsafePointer<CChar>?, UnsafeMutableRawPointer?) -> Void = { _, _, _ in }
-        llama_log_set(noopCallback, nil)
-        ggml_log_set(noopCallback, nil)
+        LlamaBackend.shared.silenceLogging()
     }
     
     /// Creates an embedding model from a file path.
@@ -65,8 +55,8 @@ public actor EmbeddingModel {
     ///   - gpuLayers: Number of layers to offload to GPU (-1 for all, 0 for CPU only)
     /// - Throws: `EmbeddingModelError.modelLoadFailed` if the model cannot be loaded
     public init(from path: String, maxTokenCount: Int = 512, gpuLayers: Int32 = -1) throws {
-        Self.ensureBackendInitialized()
-        Self.silenceLogging()
+        LlamaBackend.shared.ensureInitialized()
+        LlamaBackend.shared.silenceLogging()
         
         self.modelPath = path
         self.maxTokenCount = maxTokenCount
@@ -125,10 +115,17 @@ public actor EmbeddingModel {
         let tokens = tokenize(text)
         guard !tokens.isEmpty else { throw EmbeddingModelError.tokenizationFailed }
         
-        try processBatch(tokens)
-        let values = try extractEmbeddings()
+        // Capture actor-isolated properties for use in serialized block
+        let ctx = context
+        let localBatch = batch
+        let embDim = embeddingDimension
         
-        return Embeddings(values: values)
+        // Serialize llama.cpp operations to prevent GPU resource contention
+        return try LlamaBackend.shared.execute {
+            try Self.processBatchStatic(context: ctx, batch: localBatch, tokens: tokens)
+            let values = try Self.extractEmbeddingsStatic(context: ctx, embeddingDimension: embDim)
+            return Embeddings(values: values)
+        }
     }
     
     /// Generates embeddings for multiple texts in a batch.
@@ -177,51 +174,55 @@ public actor EmbeddingModel {
         return tokens
     }
     
-    private func processBatch(_ tokens: [llama_token]) throws {
+    /// Static helper for batch processing - called within LlamaBackend.execute
+    private static func processBatchStatic(context: OpaquePointer, batch: llama_batch, tokens: [llama_token]) throws {
         llama_memory_clear(llama_get_memory(context), false)
         
-        batch.n_tokens = 0
+        var localBatch = batch
+        localBatch.n_tokens = 0
         
         for (i, token) in tokens.enumerated() {
-            let idx = Int(batch.n_tokens)
-            batch.token[idx] = token
-            batch.pos[idx] = Int32(i)
-            batch.n_seq_id[idx] = 1
-            if let seq_id = batch.seq_id[idx] {
+            let idx = Int(localBatch.n_tokens)
+            localBatch.token[idx] = token
+            localBatch.pos[idx] = Int32(i)
+            localBatch.n_seq_id[idx] = 1
+            if let seq_id = localBatch.seq_id[idx] {
                 seq_id[0] = 0
             }
-            batch.logits[idx] = (i == tokens.count - 1) ? 1 : 0
-            batch.n_tokens += 1
+            localBatch.logits[idx] = (i == tokens.count - 1) ? 1 : 0
+            localBatch.n_tokens += 1
         }
         
-        let result = llama_decode(context, batch)
+        let result = llama_decode(context, localBatch)
         guard result == 0 else {
             throw EmbeddingModelError.batchProcessingFailed
         }
     }
     
-    private func extractEmbeddings() throws -> [Float] {
+    /// Static helper for extracting embeddings - called within LlamaBackend.execute
+    private static func extractEmbeddingsStatic(context: OpaquePointer, embeddingDimension: Int) throws -> [Float] {
         guard let embeddingsPtr = llama_get_embeddings_seq(context, 0) else {
             guard let embeddingsPtr = llama_get_embeddings_ith(context, -1) else {
                 throw EmbeddingModelError.embeddingsFailed
             }
-            return extractFromPointer(embeddingsPtr)
+            return extractFromPointerStatic(embeddingsPtr, dimension: embeddingDimension)
         }
-        return extractFromPointer(embeddingsPtr)
+        return extractFromPointerStatic(embeddingsPtr, dimension: embeddingDimension)
     }
     
-    private func extractFromPointer(_ ptr: UnsafePointer<Float>) -> [Float] {
+    /// Static helper for pointer extraction - called within LlamaBackend.execute
+    private static func extractFromPointerStatic(_ ptr: UnsafePointer<Float>, dimension: Int) -> [Float] {
         var values: [Float] = []
-        values.reserveCapacity(embeddingDimension)
+        values.reserveCapacity(dimension)
         
-        for i in 0..<embeddingDimension {
+        for i in 0..<dimension {
             values.append(ptr[i])
         }
         
-        return normalizeL2(values)
+        return normalizeL2Static(values)
     }
     
-    private func normalizeL2(_ values: [Float]) -> [Float] {
+    private static func normalizeL2Static(_ values: [Float]) -> [Float] {
         let magnitude = sqrt(values.reduce(0) { $0 + $1 * $1 })
         guard magnitude > 0 else { return values }
         return values.map { $0 / magnitude }

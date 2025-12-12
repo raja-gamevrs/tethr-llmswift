@@ -14,19 +14,116 @@ The integration provides:
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│                        App                                │
+│                           App                                   │
 ├─────────────────────────────────────────────────────────────────┤
 │  ┌──────────────┐    ┌──────────────┐    ┌──────────────────┐  │
 │  │ EmbeddingModel│    │     LLM      │    │   RAGPipeline    │  │
 │  │ (all-MiniLM) │    │   (Gemma)    │    │ (Vector Store)   │  │
 │  └──────┬───────┘    └──────┬───────┘    └────────┬─────────┘  │
 │         │                   │                      │            │
-│         │    ┌──────────────┴──────────────┐      │            │
-│         └────┤     Parallel Execution      ├──────┘            │
-│              └─────────────────────────────┘                   │
-├─────────────────────────────────────────────────────────────────┤
+│         └───────────────────┼──────────────────────┘            │
+│                             │                                   │
+│              ┌──────────────▼──────────────┐                   │
+│              │       LlamaBackend          │                   │
+│              │  (Serialized GPU Access)    │                   │
+│              └──────────────┬──────────────┘                   │
+├─────────────────────────────┼───────────────────────────────────┤
 │                      llama.cpp (Metal)                          │
 └─────────────────────────────────────────────────────────────────┘
+```
+
+### Multi-Model Memory Architecture
+
+Both models remain loaded in memory simultaneously:
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    GPU/CPU Memory                               │
+├─────────────────────────────────────────────────────────────────┤
+│  ┌─────────────────────┐    ┌─────────────────────────────┐    │
+│  │   Embedding Model   │    │        Chat Model           │    │
+│  │   (MiniLM ~21MB)    │    │     (Gemma-3 4B ~2.5GB)     │    │
+│  │   Always Resident   │    │      Always Resident        │    │
+│  └─────────────────────┘    └─────────────────────────────┘    │
+└─────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────┐
+│                    GPU Execution (Serialized)                   │
+├─────────────────────────────────────────────────────────────────┤
+│  Time ──────────────────────────────────────────────────────►   │
+│                                                                 │
+│  Embed: ████░░░░░░░░████░░░░░░░░░░░░░░░░████                   │
+│  Chat:  ░░░░████████░░░░████████████████░░░░                   │
+│         ▲                                                       │
+│         └── Operations serialized, never overlap                │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+## Multi-Model Support (LlamaBackend)
+
+The library includes `LlamaBackend`, a centralized manager that enables running multiple llama.cpp models simultaneously without crashes.
+
+### Why This Is Needed
+
+llama.cpp with Metal backend cannot safely run multiple model contexts at the same time. When both a chat model and embedding model try to use the GPU simultaneously, it causes crashes due to Metal resource conflicts.
+
+### How It Works
+
+1. **Single Backend Initialization**: `llama_backend_init()` is called exactly once, regardless of how many models you load
+2. **Serialized GPU Access**: All `llama_decode()` calls are queued through a serial dispatch queue
+3. **Memory Coexistence**: Both models stay loaded in memory - only execution is serialized
+
+### Automatic Handling
+
+You don't need to do anything special - the library handles serialization internally:
+
+```swift
+// Both models load and coexist in memory
+let embedder = try EmbeddingModel(from: embedModelPath)  // Uses LlamaBackend internally
+let chatModel = LLM(from: chatModelPath)!                // Uses LlamaBackend internally
+
+// Safe to call from different tasks/threads
+Task {
+    let embedding = try await embedder.embed("query")    // Serialized automatically
+}
+Task {
+    await chatModel.respond(to: "Hello")                 // Waits if embedder is running
+}
+```
+
+### Manual Access (Advanced)
+
+For custom llama.cpp operations, use `LlamaBackend.shared.execute`:
+
+```swift
+import LLM
+
+// Wrap any GPU-intensive llama.cpp call
+let result = LlamaBackend.shared.execute {
+    llama_decode(context, batch)
+}
+
+// Async version
+let result = await LlamaBackend.shared.executeAsync {
+    llama_decode(context, batch)
+}
+
+// Check active model count
+print(LlamaBackend.shared.modelCount)  // e.g., 2
+```
+
+### Performance Impact
+
+- **Latency**: Minimal - only adds wait time when operations actually overlap
+- **Memory**: No impact - models stay resident regardless
+- **Throughput**: Sequential execution means one operation at a time
+
+Typical timeline when both models are active:
+```
+User sends message:
+  1. Embed query (20ms)     <- Embedding model runs
+  2. Search vectors (5ms)   <- CPU only, no serialization
+  3. Generate response      <- Chat model runs (waits if embed still running)
 ```
 
 ## Installation

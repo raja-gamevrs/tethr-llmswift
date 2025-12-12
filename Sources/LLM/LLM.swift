@@ -221,7 +221,12 @@ public actor LLMCore {
         for (i, token) in tokens.enumerated() {
             addToBatch(token: token, pos: currentTokenCount + Int32(i), isLogit: i == initialCount - 1)
         }
-        guard llama_decode(context, batch) == 0 else { return false }
+        
+        // Serialize llama.cpp decode to prevent GPU resource contention
+        let decodeResult = LlamaBackend.shared.execute {
+            llama_decode(self.context, self.batch)
+        }
+        guard decodeResult == 0 else { return false }
         
         currentTokenCount += Int32(initialCount)
         shouldContinuePredicting = true
@@ -281,7 +286,11 @@ public actor LLMCore {
         clearBatch()
         addToBatch(token: token, pos: currentTokenCount)
         
-        if llama_decode(context, batch) != 0 {
+        // Serialize llama.cpp decode to prevent GPU resource contention
+        let decodeResult = LlamaBackend.shared.execute {
+            llama_decode(self.context, self.batch)
+        }
+        if decodeResult != 0 {
             shouldContinuePredicting = false
             return endToken
         }
@@ -301,7 +310,11 @@ public actor LLMCore {
             }
             clearBatch()
             addToBatch(token: token, pos: currentTokenCount)
-            guard llama_decode(context, batch) == 0 else {
+            // Serialize llama.cpp decode to prevent GPU resource contention
+            let decodeResult = LlamaBackend.shared.execute {
+                llama_decode(self.context, self.batch)
+            }
+            guard decodeResult == 0 else {
                 shouldContinuePredicting = false
                 return false
             }
@@ -476,7 +489,11 @@ public actor LLMCore {
             addToBatchForEmbeddings(token: token, pos: Int32(i), isLogit: i == tokens.count - 1)
         }
         
-        guard llama_decode(context, batch) == 0 else { throw LLMError.embeddingsFailed }
+        // Serialize llama.cpp decode to prevent GPU resource contention
+        let decodeResult = LlamaBackend.shared.execute {
+            llama_decode(self.context, self.batch)
+        }
+        guard decodeResult == 0 else { throw LLMError.embeddingsFailed }
     }
     
     private func addToBatchForEmbeddings(token: Token, pos: Int32, isLogit: Bool = true) {
@@ -596,7 +613,11 @@ public actor LLMCore {
         }
         clearBatch()
         addToBatch(token: token, pos: currentTokenCount)
-        guard llama_decode(context, batch) == 0 else {
+        // Serialize llama.cpp decode to prevent GPU resource contention
+        let decodeResult = LlamaBackend.shared.execute {
+            llama_decode(self.context, self.batch)
+        }
+        guard decodeResult == 0 else {
             shouldContinuePredicting = false
             throw LLMError.decodingFailed
         }
@@ -1257,20 +1278,13 @@ open class LLM: ObservableObject {
     static var isLogSilenced = false
     
     fileprivate static func ensureInitialized() {
-        struct Initialization {
-            static let invoke: Void = {
-                llama_backend_init()
-            }()
-        }
-        _ = Initialization.invoke
+        LlamaBackend.shared.ensureInitialized()
     }
 
     static func silenceLogging() {
         guard !isLogSilenced else { return }
         isLogSilenced = true
-        let noopCallback: @convention(c) (ggml_log_level, UnsafePointer<CChar>?, UnsafeMutableRawPointer?) -> Void = { _, _, _ in }
-        llama_log_set(noopCallback, nil)
-        ggml_log_set(noopCallback, nil)
+        LlamaBackend.shared.silenceLogging()
     }
     
     
