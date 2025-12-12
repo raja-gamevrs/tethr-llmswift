@@ -50,10 +50,10 @@ public actor EmbeddingModel {
     ///
     /// - Parameters:
     ///   - path: Path to the GGUF model file
-    ///   - maxTokenCount: Maximum context size (default: 512, sufficient for most embedding models)
+    ///   - maxTokenCount: Maximum context size (default: 2048, must be >= tokens in any single embed call)
     ///   - gpuLayers: Number of layers to offload to GPU (-1 for all, 0 for CPU only)
     /// - Throws: `EmbeddingModelError.modelLoadFailed` if the model cannot be loaded
-    public init(from path: String, maxTokenCount: Int = 512, gpuLayers: Int32 = -1) throws {
+    public init(from path: String, maxTokenCount: Int = 2048, gpuLayers: Int32 = -1) throws {
         LlamaBackend.shared.ensureInitialized()
         LlamaBackend.shared.silenceLogging()
         
@@ -93,7 +93,7 @@ public actor EmbeddingModel {
     }
     
     /// Creates an embedding model from a URL.
-    public init(from url: URL, maxTokenCount: Int = 512, gpuLayers: Int32 = -1) throws {
+    public init(from url: URL, maxTokenCount: Int = 2048, gpuLayers: Int32 = -1) throws {
         try self.init(from: url.path, maxTokenCount: maxTokenCount, gpuLayers: gpuLayers)
     }
     
