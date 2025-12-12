@@ -33,7 +33,6 @@ public actor EmbeddingModel {
     private let model: OpaquePointer
     private let vocab: OpaquePointer
     private var context: OpaquePointer
-    private var batch: llama_batch
     private let maxTokenCount: Int
     
     /// The embedding dimension of the loaded model.
@@ -91,7 +90,6 @@ public actor EmbeddingModel {
             throw EmbeddingModelError.contextCreationFailed
         }
         self.context = context
-        self.batch = llama_batch_init(Int32(maxTokenCount), 0, 1)
     }
     
     /// Creates an embedding model from a URL.
@@ -100,7 +98,6 @@ public actor EmbeddingModel {
     }
     
     deinit {
-        llama_batch_free(batch)
         llama_free(context)
         llama_model_free(model)
     }
@@ -118,12 +115,11 @@ public actor EmbeddingModel {
         
         // Capture actor-isolated properties for use in serialized block
         let ctx = context
-        let localBatch = batch
         let embDim = embeddingDimension
         
         // Serialize llama.cpp operations to prevent GPU resource contention
         return try LlamaBackend.shared.execute {
-            try Self.processBatchStatic(context: ctx, batch: localBatch, tokens: tokens)
+            try Self.processBatchStatic(context: ctx, tokens: tokens)
             let values = try Self.extractEmbeddingsStatic(context: ctx, embeddingDimension: embDim)
             return Embeddings(values: values)
         }
@@ -176,25 +172,18 @@ public actor EmbeddingModel {
     }
     
     /// Static helper for batch processing - called within LlamaBackend.execute
-    private static func processBatchStatic(context: OpaquePointer, batch: llama_batch, tokens: [llama_token]) throws {
+    /// Uses llama_batch_get_one to avoid seq_id pointer issues with struct copying
+    private static func processBatchStatic(context: OpaquePointer, tokens: [llama_token]) throws {
         llama_memory_clear(llama_get_memory(context), false)
         
-        var localBatch = batch
-        localBatch.n_tokens = 0
-        
-        for (i, token) in tokens.enumerated() {
-            let idx = Int(localBatch.n_tokens)
-            localBatch.token[idx] = token
-            localBatch.pos[idx] = Int32(i)
-            localBatch.n_seq_id[idx] = 1
-            if let seq_id = localBatch.seq_id[idx] {
-                seq_id[0] = 0
-            }
-            localBatch.logits[idx] = (i == tokens.count - 1) ? 1 : 0
-            localBatch.n_tokens += 1
+        // Use llama_batch_get_one for simple single-sequence embedding
+        // This avoids issues with seq_id pointer management when copying llama_batch structs
+        let tokenCount = Int32(tokens.count)
+        let result = tokens.withUnsafeBufferPointer { tokensPtr in
+            let simpleBatch = llama_batch_get_one(UnsafeMutablePointer(mutating: tokensPtr.baseAddress!), tokenCount)
+            return llama_decode(context, simpleBatch)
         }
         
-        let result = llama_decode(context, localBatch)
         guard result == 0 else {
             throw EmbeddingModelError.batchProcessingFailed
         }
