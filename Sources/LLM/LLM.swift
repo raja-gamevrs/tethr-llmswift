@@ -1318,7 +1318,18 @@ open class LLM: ObservableObject {
         #if targetEnvironment(simulator)
         modelParams.n_gpu_layers = 0
         #endif
-        guard let model = llama_model_load_from_file(self.path, modelParams) else {
+        var model = llama_model_load_from_file(self.path, modelParams)
+        
+        // If GPU load fails on real device, fallback to CPU-only mode
+        #if !targetEnvironment(simulator)
+        if model == nil {
+            print("[LLM] GPU model load failed, falling back to CPU-only mode")
+            modelParams.n_gpu_layers = 0
+            model = llama_model_load_from_file(self.path, modelParams)
+        }
+        #endif
+        
+        guard let model else {
             return nil
         }
         self.model = model
