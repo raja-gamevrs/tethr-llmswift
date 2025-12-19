@@ -2,11 +2,6 @@ import Foundation
 import llama
 @_exported import LLMMacros
 
-public enum ThinkingMode: Sendable {
-    case none
-    case suppressed
-    case enabled
-}
 
 /// A token used by the language model.
 public typealias Token = llama_token
@@ -22,7 +17,6 @@ public typealias Vocab = OpaquePointer
 
 /// A chat message consisting of a role and content.
 public typealias Chat = (role: Role, content: String)
-
 
 /// Core actor responsible for thread-safe interactions with the llama.cpp library.
 ///
@@ -45,22 +39,11 @@ public actor LLMCore {
     
     private let maxTokenCount: Int
     private let totalTokenCount: Int
-    
-    public lazy var newlineToken: Token = llama_vocab_nl(vocab)
-    public lazy var endOfTurnToken: Token = llama_vocab_eot(vocab)
-    public lazy var separatorToken: Token = llama_vocab_sep(vocab)
-    public lazy var paddingToken: Token = llama_vocab_pad(vocab)
-    
-    private lazy var startToken: Token = llama_vocab_bos(vocab)
+    private lazy var newlineToken: Token = llama_vocab_nl(vocab)
     private lazy var endToken: Token = llama_vocab_eos(vocab)
     private lazy var nullToken: Token = encode("\0", shouldAddBOS: false).first!
     private lazy var quoteToken: Token = encode("\"", shouldAddBOS: false, special: false).first!
     private lazy var whitespaceToken: Token = encode(" ", shouldAddBOS: false, special: false).first!
-    
-    private var thinkingStartTokens: [Token]?
-    private var thinkingEndTokens: [Token]?
-    private var thinkingStartMarker: String?
-    private var thinkingEndMarker: String?
     
     private var stopSequenceTokens: [Token]?
     private var tokenBuffer: [Token] = []
@@ -93,13 +76,6 @@ public actor LLMCore {
         }
     }
     
-    func setThinkingTokens(start: [Token]?, end: [Token]?, startMarker: String?, endMarker: String?) {
-        thinkingStartTokens = start
-        thinkingEndTokens = end
-        thinkingStartMarker = startMarker
-        thinkingEndMarker = endMarker
-    }
-    
     private func recreateSampler() {
         if let sampler {
             llama_sampler_free(sampler)
@@ -116,7 +92,7 @@ public actor LLMCore {
     }
     
     public init(model: Model, path: [CChar], seed: UInt32, topK: Int32, topP: Float, temp: Float, repeatPenalty: Float, repetitionLookback: Int32, maxTokenCount: Int) throws {
-        LLM.ensureInitialized()
+        LlamaBackend.shared.ensureInitialized()
         self.model = model
         self.vocab = llama_model_get_vocab(model)
         self.seed = seed
@@ -152,7 +128,6 @@ public actor LLMCore {
         if let sampler {
             llama_sampler_free(sampler)
         }
-        llama_model_free(model)
     }
     
     
@@ -167,22 +142,21 @@ public actor LLMCore {
         return tokens
     }
     
-    public func decode(_ token: Token, special: Bool = false) -> String {
-        let cacheKey = special ? token + Int32(totalTokenCount) : token
-        if let cached = tokenDecodeCache.object(forKey: NSNumber(value: cacheKey)) {
+    public func decode(_ token: Token) -> String {
+        if let cached = tokenDecodeCache.object(forKey: NSNumber(value: token)) {
             return cached as String
         }
         
         var bufferLength = 16
         var buffer: [CChar] = .init(repeating: 0, count: bufferLength)
-        var actualLength = Int(llama_token_to_piece(vocab, token, &buffer, Int32(bufferLength), 0, special))
+        var actualLength = Int(llama_token_to_piece(vocab, token, &buffer, Int32(bufferLength), 0, false))
         
         guard actualLength != 0 else { return "" }
         
         if actualLength < 0 {
             bufferLength = -actualLength
             buffer = .init(repeating: 0, count: bufferLength)
-            actualLength = Int(llama_token_to_piece(vocab, token, &buffer, Int32(bufferLength), 0, special))
+            actualLength = Int(llama_token_to_piece(vocab, token, &buffer, Int32(bufferLength), 0, false))
             guard actualLength > 0 else { return "" }
         }
         
@@ -194,14 +168,9 @@ public actor LLMCore {
             decoded = decoded.filter { $0 != "\0" }
         }
         
-        tokenDecodeCache.setObject(decoded as NSString, forKey: NSNumber(value: cacheKey))
+        tokenDecodeCache.setObject(decoded as NSString, forKey: NSNumber(value: token))
         
         return decoded
-    }
-    
-    public func getChatTemplateHint() -> String? {
-        guard let template = llama_model_chat_template(model, nil) else { return nil }
-        return String(cString: template)
     }
     
     
@@ -220,7 +189,6 @@ public actor LLMCore {
         for (i, token) in tokens.enumerated() {
             addToBatch(token: token, pos: currentTokenCount + Int32(i), isLogit: i == initialCount - 1)
         }
-        
         // Serialize llama.cpp decode to prevent GPU resource contention
         let decodeResult = LlamaBackend.shared.execute {
             llama_decode(self.context, self.batch)
@@ -248,27 +216,15 @@ public actor LLMCore {
         batch.n_tokens += 1
     }
     
-    func predictNextToken(excluding: [Token] = []) -> Token {
+    func predictNextToken() -> Token {
         guard shouldContinuePredicting, currentTokenCount < Int32(maxTokenCount) else {
             return endToken
         }
         
         guard let sampler = sampler else { return endToken }
         
-        let batchIndex = batch.n_tokens - 1
-        
-        if !excluding.isEmpty, let logits = llama_get_logits_ith(context, batchIndex) {
-            for token in excluding {
-                logits[Int(token)] = -.infinity
-            }
-        }
-        
-        let token = llama_sampler_sample(sampler, context, batchIndex)
-        
-        if token == endToken {
-            return endToken
-        }
-        
+        let i = batch.n_tokens - 1
+        let token = llama_sampler_sample(sampler, context, i)
         llama_sampler_accept(sampler, token)
         
         tokenBuffer.append(token)
@@ -302,26 +258,6 @@ public actor LLMCore {
         shouldContinuePredicting = false
     }
     
-    private func injectTokensIntoContext(_ tokens: [Token]) -> Bool {
-        for token in tokens {
-            if let sampler {
-                llama_sampler_accept(sampler, token)
-            }
-            clearBatch()
-            addToBatch(token: token, pos: currentTokenCount)
-            // Serialize llama.cpp decode to prevent GPU resource contention
-            let decodeResult = LlamaBackend.shared.execute {
-                llama_decode(self.context, self.batch)
-            }
-            guard decodeResult == 0 else {
-                shouldContinuePredicting = false
-                return false
-            }
-            currentTokenCount += 1
-        }
-        return true
-    }
-    
     func resetContext() {
         currentTokenCount = 0
         tokenBuffer.removeAll()
@@ -330,128 +266,21 @@ public actor LLMCore {
         llama_memory_seq_rm(llama_get_memory(context), -1, -1, -1)
     }
     
-    func generateResponseStream(from input: String, thinking: ThinkingMode = .none) -> AsyncStream<String> {
-        generateResponseStreamWithThinking(from: input, thinking: thinking).response
-    }
-    
-    func generateThinkingStream(from input: String) -> AsyncStream<String> {
-        generateResponseStreamWithThinking(from: input, thinking: .enabled).thinking
-    }
-    
-    func generateResponseStreamWithThinking(from input: String, thinking thinkingMode: ThinkingMode = .none) -> (thinking: AsyncStream<String>, response: AsyncStream<String>) {
-        var thinkingContinuation: AsyncStream<String>.Continuation!
-        var responseContinuation: AsyncStream<String>.Continuation!
-        
-        let thinkingStream = AsyncStream<String> { thinkingContinuation = $0 }
-        let responseStream = AsyncStream<String> { responseContinuation = $0 }
-        
-        Task {
-            guard prepareContext(for: input) else {
-                thinkingContinuation.finish()
-                responseContinuation.finish()
-                return
-            }
-            
-            if let sampler { llama_sampler_reset(sampler) }
-            
-            let startMarker = thinkingStartMarker
-            let endMarker = thinkingEndMarker
-            let maxPendingLength = max(startMarker?.count ?? 0, endMarker?.count ?? 0)
-            
-            var currentlyInThinkingPhase = thinkingMode == .enabled && startMarker != nil
-            var shouldGuaranteeOutput = true
-            var pendingText = ""
-            
-            func stream(_ text: String) {
-                guard !text.isEmpty else { return }
-                if currentlyInThinkingPhase {
-                    thinkingContinuation.yield(text)
-                } else {
-                    responseContinuation.yield(text)
+    func generateResponseStream(from input: String) -> AsyncStream<String> {
+        return AsyncStream<String> { continuation in
+            Task {
+                guard prepareContext(for: input) else { return continuation.finish() }
+                if let sampler { llama_sampler_reset(sampler) }
+                
+                while shouldContinuePredicting && currentTokenCount < Int32(maxTokenCount) {
+                    let token = predictNextToken()
+                    guard token != endToken else { return continuation.finish() }
+                    let word = decode(token)
+                    continuation.yield(word)
                 }
+                continuation.finish()
             }
-            
-            func streamPendingText() {
-                stream(pendingText)
-                pendingText = ""
-            }
-            
-            func finishAllStreams() {
-                thinkingContinuation.finish()
-                responseContinuation.finish()
-            }
-            
-            func transitionToResponsePhase() {
-                streamPendingText()
-                currentlyInThinkingPhase = false
-                shouldGuaranteeOutput = true
-                thinkingContinuation.finish()
-            }
-            
-            func foundThinkingStartMarker() -> Bool {
-                guard let marker = startMarker, pendingText.hasSuffix(marker) else { return false }
-                pendingText.removeLast(marker.count)
-                streamPendingText()
-                currentlyInThinkingPhase = true
-                return true
-            }
-            
-            func foundThinkingEndMarker() -> Bool {
-                guard let marker = endMarker, pendingText.hasSuffix(marker) else { return false }
-                pendingText.removeLast(marker.count)
-                transitionToResponsePhase()
-                return true
-            }
-            
-            func streamOldestPendingTextIfNeeded() {
-                guard pendingText.count > maxPendingLength else { return }
-                let overflowLength = pendingText.count - maxPendingLength
-                stream(String(pendingText.prefix(overflowLength)))
-                pendingText.removeFirst(overflowLength)
-            }
-            
-            while shouldContinuePredicting && currentTokenCount < Int32(maxTokenCount) {
-                let excludedTokens = shouldGuaranteeOutput ? [endToken] : []
-                let token = predictNextToken(excluding: excludedTokens)
-                shouldGuaranteeOutput = false
-                
-                let reachedEndOfGeneration = token == endToken
-                
-                if reachedEndOfGeneration {
-                    let stuckInThinkingPhase = currentlyInThinkingPhase && thinkingEndTokens != nil
-                    
-                    if stuckInThinkingPhase {
-                        let injectedSuccessfully = injectTokensIntoContext(thinkingEndTokens! + [newlineToken])
-                        guard injectedSuccessfully else {
-                            finishAllStreams()
-                            return
-                        }
-                        transitionToResponsePhase()
-                        continue
-                    }
-                    
-                    streamPendingText()
-                    finishAllStreams()
-                    return
-                }
-                
-                pendingText += decode(token)
-                
-                let detectingThinkingMarkers = thinkingMode != .none
-                
-                if detectingThinkingMarkers {
-                    if foundThinkingStartMarker() { continue }
-                    if foundThinkingEndMarker() { continue }
-                }
-                
-                streamOldestPendingTextIfNeeded()
-            }
-            
-            streamPendingText()
-            finishAllStreams()
         }
-        
-        return (thinkingStream, responseStream)
     }
     
     func getEmbeddings(from input: String) throws -> [Float] {
@@ -462,16 +291,13 @@ public actor LLMCore {
             llama_set_embeddings(context, false)
         }
         
-        llama_memory_clear(llama_get_memory(context), false)
+        // Clear embeddings sequence to ensure deterministic results
+        llama_memory_seq_rm(llama_get_memory(context), 1, -1, -1)
         
         let cleanTokens = prepareTokensForEmbeddings(from: input)
         try processBatchForEmbeddings(cleanTokens)
         
-        let embeddings = try extractEmbeddingsFromContext()
-        
-        llama_memory_clear(llama_get_memory(context), false)
-        
-        return embeddings
+        return try extractEmbeddingsFromContext()
     }
     
     private func prepareTokensForEmbeddings(from input: String) -> [Token] {
@@ -501,16 +327,14 @@ public actor LLMCore {
         batch.pos[i] = pos
         batch.n_seq_id[i] = 1
         if let seq_id = batch.seq_id[i] {
-            seq_id[0] = 0
+            seq_id[0] = 1
         }
         batch.logits[i] = isLogit ? 1 : 0
         batch.n_tokens += 1
     }
     
     private func extractEmbeddingsFromContext() throws -> [Float] {
-        guard let embeddingsPtr = llama_get_embeddings_ith(context, -1) else {
-            throw LLMError.embeddingsFailed
-        }
+        guard let embeddingsPtr = llama_get_embeddings(context) else { throw LLMError.embeddingsFailed }
         
         let embeddingDimension = Int(llama_model_n_embd(model))
         var embeddingsArray: [Float] = []
@@ -527,10 +351,9 @@ public actor LLMCore {
         return debugLastGeneratedTokens
     }
     
-    public func generateWithConstraints(from input: String, jsonSchema: String, thinking: ThinkingMode = .suppressed) throws -> String {
+    func generateWithConstraints(from input: String, jsonSchema: String) throws -> String {
         debugLastGeneratedTokens = []
         guard prepareContext(for: input) else { throw LLMError.contextCreationFailed }
-        
         guard let parsedSchema = parseJSONSchema(jsonSchema) else { throw LLMError.contextCreationFailed }
         if let sampler { llama_sampler_reset(sampler) }
         
@@ -1089,7 +912,7 @@ public actor LLMCore {
         _ = llama_sampler_sample(sampler, context, i)
         
         if let logits = llama_get_logits(context) {
-            for token in protectedTokens {
+            for (index, token) in protectedTokens.enumerated() {
                 if let logit = protectedLogits[token] {
                     logits[Int(token)] = logit
                 }
@@ -1204,29 +1027,21 @@ public enum StructuredOutputError: Error {
 open class LLM: ObservableObject {
     private(set) var model: Model
     public var history: [Chat]
-    public var preprocess: @Sendable (_ input: String, _ history: [Chat], _ thinking: ThinkingMode) -> String = { input, _, _ in return input }
+    public var preprocess: @Sendable (_ input: String, _ history: [Chat]) -> String = { input, _ in return input }
     public var postprocess: @Sendable (_ output: String) -> Void = { print($0) }
     public var update: @Sendable (_ outputDelta: String?) -> Void = { _ in }
-    public var updateThinking: @Sendable (_ thinkingDelta: String?) -> Void = { _ in }
     
     @Published public private(set) var output = ""
-    @Published public private(set) var thinking = ""
     
     public var template: Template? = nil {
         didSet {
             guard let template else {
-                preprocess = { input, _, _ in return input }
-                Task {
-                    await core.setStopSequence(nil)
-                    await core.setThinkingTokens(start: nil, end: nil, startMarker: nil, endMarker: nil)
-                }
+                preprocess = { input, _ in return input }
+                Task { await core.setStopSequence(nil) }
                 return
             }
             preprocess = template.preprocess
-            Task {
-                await core.setStopSequence(template.stopSequence)
-                await setupThinkingTokens(from: template)
-            }
+            Task { await core.setStopSequence(template.stopSequence) }
         }
     }
     
@@ -1270,19 +1085,14 @@ open class LLM: ObservableObject {
     public var path: [CChar]
     
     public let core: LLMCore
-    
     private var isAvailable = true
     private var input: String = ""
     
-    static var isLogSilenced = false
-    
-    fileprivate static func ensureInitialized() {
+    static func ensureInitialized() {
         LlamaBackend.shared.ensureInitialized()
     }
-
+    
     static func silenceLogging() {
-        guard !isLogSilenced else { return }
-        isLogSilenced = true
         LlamaBackend.shared.silenceLogging()
     }
     
@@ -1300,7 +1110,7 @@ open class LLM: ObservableObject {
         historyLimit: Int = 8,
         maxTokenCount: Int32 = 2048
     ) {
-        LLM.silenceLogging()
+        LlamaBackend.shared.silenceLogging()
         self.path = path.cString(using: .utf8)!
         self.seed = seed
         self.topK = topK
@@ -1438,32 +1248,15 @@ open class LLM: ObservableObject {
             historyLimit: historyLimit,
             maxTokenCount: maxTokenCount
         )
-        await setupThinkingTokens(from: huggingFaceModel.template)
     }
     
-    private func setupThinkingTokens(from template: Template?) async {
-        guard let template else { return }
-        let (startTokens, startMarker) = await convertToTokensAndMarker(template.thinkingStart)
-        let (endTokens, endMarker) = await convertToTokensAndMarker(template.thinkingEnd)
-        await core.setThinkingTokens(start: startTokens, end: endTokens, startMarker: startMarker, endMarker: endMarker)
+    deinit {
+        llama_model_free(model)
     }
     
-    private func convertToTokensAndMarker(_ sequence: TokenSequence?) async -> ([Token]?, String?) {
-        guard let sequence else { return (nil, nil) }
-        switch sequence {
-        case .string(let text):
-            return (await core.encode(text, shouldAddBOS: false, special: false), text)
-        case .token(let token):
-            return ([token], await core.decode(token, special: true))
-        }
-    }
     
     @MainActor public func setOutput(to newOutput: consuming String) {
         output = newOutput
-    }
-    
-    @MainActor public func setThinking(to newThinking: consuming String) {
-        thinking = newThinking
     }
     
     public func stop() {
@@ -1488,23 +1281,22 @@ open class LLM: ObservableObject {
         let response = await core.generateResponseStream(from: input)
         var output = ""
         
-        for await content in response {
-            output += content
+        for await responseDelta in response {
+            output += responseDelta
         }
         
         return output
     }
     
-    public func respond(to input: String, thinking: ThinkingMode = .none, with makeOutputFrom: @escaping (AsyncStream<String>) async -> String) async {
+    public func respond(to input: String, with makeOutputFrom: @escaping (AsyncStream<String>) async -> String) async {
         guard isAvailable else { return }
         
         isAvailable = false
         defer { isAvailable = true }
         
         self.input = input
-        let processedInput = preprocess(input, history, thinking)
-        
-        let response = await core.generateResponseStream(from: processedInput, thinking: thinking)
+        let processedInput = preprocess(input, history)
+        let response = await core.generateResponseStream(from: processedInput)
         let output = await makeOutputFrom(response)
         
         history += [(.user, input), (.bot, output)]
@@ -1516,48 +1308,21 @@ open class LLM: ObservableObject {
         postprocess(output)
     }
     
-    open func respond(to input: String, thinking: ThinkingMode = .none) async {
-        guard isAvailable else { return }
-        
-        isAvailable = false
-        defer { isAvailable = true }
-        
-        self.input = input
-        let processedInput = preprocess(input, history, thinking)
-        
-        let (thinkingStream, responseStream) = await core.generateResponseStreamWithThinking(from: processedInput, thinking: thinking)
-        
-        await setOutput(to: "")
-        await setThinking(to: "")
-        
-        await withTaskGroup(of: Void.self) { group in
-            group.addTask {
-                for await content in thinkingStream {
-                    self.updateThinking(content)
-                    await self.setThinking(to: self.thinking + content)
-                }
-                self.updateThinking(nil)
-            }
+    open func respond(to input: String) async {
+        await respond(to: input) { [weak self] response in
+            guard let self = self else { return "" }
             
-            group.addTask {
-                for await content in responseStream {
-                    self.update(content)
-                    await self.setOutput(to: self.output + content)
-                }
-                self.update(nil)
+            await self.setOutput(to: "")
+            for await responseDelta in response {
+                self.update(responseDelta)
+                await self.setOutput(to: self.output + responseDelta)
             }
+            self.update(nil)
+            
+            let trimmedOutput = self.output.trimmingCharacters(in: .whitespacesAndNewlines)
+            await self.setOutput(to: trimmedOutput.isEmpty ? "..." : trimmedOutput)
+            return self.output
         }
-        
-        let trimmedOutput = output.trimmingCharacters(in: .whitespacesAndNewlines)
-        await setOutput(to: trimmedOutput.isEmpty ? "..." : trimmedOutput)
-        
-        history += [(.user, input), (.bot, output)]
-        let historyCount = history.count
-        if historyLimit < historyCount {
-            history.removeFirst(min(2, historyCount))
-        }
-        
-        postprocess(output)
     }
     
     public func encode(_ text: borrowing String, shouldAddBOS: Bool = true) async -> [Token] {
@@ -1571,8 +1336,7 @@ open class LLM: ObservableObject {
     
     public func respond<T: Generatable>(
         to prompt: String,
-        as type: T.Type,
-        thinking: ThinkingMode = .none
+        as type: T.Type
     ) async throws -> StructuredOutput<T> {
         let schemaPrompt = """
         \(prompt)
@@ -1581,12 +1345,11 @@ open class LLM: ObservableObject {
         Matches this exact schema: \(T.jsonSchema)
         Return only the JSON object, no other text.
         """
-        let processedPrompt = preprocess(schemaPrompt, history, thinking)
+        let processedPrompt = preprocess(schemaPrompt, history)
         
         let rawOutput = try await core.generateWithConstraints(
             from: processedPrompt,
-            jsonSchema: T.jsonSchema,
-            thinking: thinking
+            jsonSchema: T.jsonSchema
         )
         
         guard let jsonData = rawOutput.data(using: .utf8) else {
@@ -1620,29 +1383,6 @@ public enum Role {
     case bot
 }
 
-/// A sequence of tokens that can be represented as either a string or a single token ID.
-public enum TokenSequence: Sendable, Equatable {
-    case string(String)
-    case token(Token)
-    
-    public var stringValue: String? {
-        if case .string(let value) = self { return value }
-        return nil
-    }
-}
-
-extension TokenSequence: ExpressibleByStringLiteral {
-    public init(stringLiteral value: String) {
-        self = .string(value)
-    }
-}
-
-extension TokenSequence: ExpressibleByIntegerLiteral {
-    public init(integerLiteral value: Int32) {
-        self = .token(value)
-    }
-}
-
 /// A chat template for formatting conversations according to model-specific formats.
 ///
 /// Templates handle the preprocessing of user input and conversation history
@@ -1655,8 +1395,6 @@ public struct Template: Sendable {
     public let bot: Attachment
     public let systemPrompt: String?
     public let stopSequence: String?
-    public let thinkingStart: TokenSequence?
-    public let thinkingEnd: TokenSequence?
     public let prefix: String
     public let shouldDropLast: Bool
     
@@ -1666,8 +1404,6 @@ public struct Template: Sendable {
         user: Attachment? = nil,
         bot: Attachment? = nil,
         stopSequence: String? = nil,
-        thinkingStart: TokenSequence? = nil,
-        thinkingEnd: TokenSequence? = nil,
         systemPrompt: String?,
         shouldDropLast: Bool = false
     ) {
@@ -1675,15 +1411,13 @@ public struct Template: Sendable {
         self.user = user  ?? ("", "")
         self.bot = bot ?? ("", "")
         self.stopSequence = stopSequence
-        self.thinkingStart = thinkingStart
-        self.thinkingEnd = thinkingEnd
         self.systemPrompt = systemPrompt
         self.prefix = prefix
         self.shouldDropLast = shouldDropLast
     }
     
-    public var preprocess: @Sendable (_ input: String, _ history: [Chat], _ thinking: ThinkingMode) -> String {
-        return { [self] input, history, thinking in
+    public var preprocess: @Sendable (_ input: String, _ history: [Chat]) -> String {
+        return { [self] input, history in
             var processed = prefix
             if let systemPrompt {
                 processed += "\(system.prefix)\(systemPrompt)\(system.suffix)"
@@ -1701,13 +1435,6 @@ public struct Template: Sendable {
             } else {
                 processed += bot.prefix
             }
-            
-            if thinking == .enabled, let start = thinkingStart?.stringValue {
-                processed += start
-            } else if thinking == .suppressed, let start = thinkingStart?.stringValue, let end = thinkingEnd?.stringValue {
-                processed += start + end
-            }
-            
             return processed
         }
     }
@@ -1718,8 +1445,6 @@ public struct Template: Sendable {
             user: ("<|im_start|>user\n", "<|im_end|>\n"),
             bot: ("<|im_start|>assistant\n", "<|im_end|>\n"),
             stopSequence: "<|im_end|>",
-            thinkingStart: "<think>",
-            thinkingEnd: "</think>",
             systemPrompt: systemPrompt
         )
     }
@@ -1741,8 +1466,6 @@ public struct Template: Sendable {
             user: ("", " [/INST]"),
             bot: (" ", "</s><s>[INST] "),
             stopSequence: "</s>",
-            thinkingStart: "[THINK]",
-            thinkingEnd: "[/THINK]",
             systemPrompt: systemPrompt,
             shouldDropLast: true
         )
@@ -1752,8 +1475,6 @@ public struct Template: Sendable {
         user: ("[INST] ", " [/INST]"),
         bot: ("", "</s> "),
         stopSequence: "</s>",
-        thinkingStart: "[THINK]",
-        thinkingEnd: "[/THINK]",
         systemPrompt: nil
     )
     
@@ -1761,8 +1482,6 @@ public struct Template: Sendable {
         user: ("<start_of_turn>user\n", "<end_of_turn>\n"),
         bot: ("<start_of_turn>model\n", "<end_of_turn>\n"),
         stopSequence: "<end_of_turn>",
-        thinkingStart: "<think>",
-        thinkingEnd: "</think>",
         systemPrompt: nil
     )
 }
@@ -1822,10 +1541,10 @@ public struct HuggingFaceModel {
         self.filterRegexPattern = filterRegexPattern
     }
     
-    public init(_ name: String, _ quantization: Quantization? = .Q4_K_M, template: Template) {
+    public init(_ name: String, _ quantization: Quantization = .Q4_K_M, template: Template) {
         self.name = name
         self.template = template
-        self.filterRegexPattern = quantization.map { "(?i)\($0.rawValue)" } ?? ".*"
+        self.filterRegexPattern = "(?i)\(quantization.rawValue)"
     }
     
     package func getDownloadURLStrings() async throws -> [String] {
