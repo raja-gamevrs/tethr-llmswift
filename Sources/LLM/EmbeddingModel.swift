@@ -68,12 +68,20 @@ public actor EmbeddingModel {
         #endif
         
         let cPath = path.cString(using: .utf8)!
-        guard let model = llama_model_load_from_file(cPath, modelParams) else {
+        var model = llama_model_load_from_file(cPath, modelParams)
+        
+        #if !targetEnvironment(simulator)
+        // If GPU model load fails on real device, fallback to CPU-only mode for embeddings
+        if model == nil && modelParams.n_gpu_layers != 0 {
+            print("[EmbeddingModel] GPU model load failed, falling back to CPU-only mode")
+            modelParams.n_gpu_layers = 0
+            model = llama_model_load_from_file(cPath, modelParams)
+        }
+        #endif
+        
+        guard let model else {
             throw EmbeddingModelError.modelLoadFailed
         }
-        self.model = model
-        self.vocab = llama_model_get_vocab(model)
-        self.embeddingDimension = Int(llama_model_n_embd(model))
         
         var contextParams = llama_context_default_params()
         let processorCount = Int32(ProcessInfo().processorCount)
@@ -85,10 +93,36 @@ public actor EmbeddingModel {
         contextParams.embeddings = true
         contextParams.pooling_type = LLAMA_POOLING_TYPE_MEAN
         
-        guard let context = llama_init_from_model(model, contextParams) else {
+        var context = llama_init_from_model(model, contextParams)
+        var finalModel = model
+        
+        #if !targetEnvironment(simulator)
+        // If context creation failed on real device, retry with CPU-only mode
+        if context == nil && modelParams.n_gpu_layers != 0 {
+            print("[EmbeddingModel] Context creation failed (likely Metal shader issue), retrying with CPU-only mode")
             llama_model_free(model)
+            
+            modelParams.n_gpu_layers = 0
+            guard let cpuModel = llama_model_load_from_file(cPath, modelParams) else {
+                throw EmbeddingModelError.modelLoadFailed
+            }
+            finalModel = cpuModel
+            
+            context = llama_init_from_model(cpuModel, contextParams)
+            if context != nil {
+                print("[EmbeddingModel] ✅ Successfully loaded embedding model in CPU-only mode")
+            }
+        }
+        #endif
+        
+        guard let context else {
+            llama_model_free(finalModel)
             throw EmbeddingModelError.contextCreationFailed
         }
+        
+        self.model = finalModel
+        self.vocab = llama_model_get_vocab(finalModel)
+        self.embeddingDimension = Int(llama_model_n_embd(finalModel))
         self.context = context
     }
     
